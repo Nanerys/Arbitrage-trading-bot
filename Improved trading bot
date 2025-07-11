@@ -1,0 +1,721 @@
+#!/usr/bin/env python3
+"""
+Improved Triangular Arbitrage Bot for Cryptocurrency Exchanges
+
+This script automates the process of finding and executing triangular arbitrage
+opportunities on cryptocurrency exchanges like Binance.
+
+DISCLAIMER: This is for educational purposes only. Trading cryptocurrencies
+involves significant risk. Use at your own risk.
+
+Requirements:
+- Python 3.7+
+- python-binance library
+- Access to exchange API with trading permissions
+- Sufficient funds in your exchange account
+
+Usage:
+1. Set up API keys with your exchange
+2. Configure the settings below
+3. Run the script
+"""
+
+import time
+import math
+import logging
+import random
+from decimal import Decimal, getcontext
+import concurrent.futures
+import json
+import os
+from typing import Dict, List, Tuple, Optional, Any
+
+# You would need to install these dependencies
+# pip install python-binance pandas numpy
+
+try:
+    from binance.client import Client
+    from binance.exceptions import BinanceAPIException, BinanceOrderException
+except ImportError:
+    print("Please install the python-binance package: pip install python-binance")
+    exit(1)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("triangular_arbitrage.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("TriangularArbitrage")
+
+# Set decimal precision
+getcontext().prec = 10
+
+# Configuration - REPLACE WITH YOUR OWN VALUES
+CONFIG = {
+    "api_key": "TsJ9yz6dNlQEVPPWbovFtnMiab6gAGKxvdTJSmFv4aAsQMZXG9azHh7sbasv72zE",
+    "api_secret": "78esxSsVZ5pIn2ODXvmNtoqfbD6b61EfS73MHlQcHHBAJJafvSBfb1ynLyvJj0EO",
+    "base_currency": "USDT",  # Starting currency
+    "alt_currency": "BTC",    # Alternative quote currency to create triangles
+    "min_profit_percent": 0.5,  # Minimum profit threshold (after fees)
+    # Amount in base_currency to trade (changed to $5)
+    "trade_amount": 3,
+    "max_trade_count": 10,    # Maximum number of trades to execute
+    "test_mode": False,        # Set to False to execute real trades
+    # Time in seconds between market checks (increased to 6 seconds)
+    "update_interval": 6.0,
+    "fee_rate": 0.1,          # Trading fee percentage (0.1 = 0.1%)
+    "max_retries": 3,         # Maximum number of retries for API calls
+    "enable_rollback": True,  # Enable automatic rollback of incomplete trades
+    # Factor for exponential backoff (wait time multiplier)
+    "backoff_factor": 2,
+    # Random jitter factor to add to backoff times (0.1 = 10%)
+    "jitter": 0.1,
+}
+
+
+class TriangularArbitrageBot:
+    """Bot that identifies and executes triangular arbitrage opportunities."""
+
+    def _init_(self, config: Dict[str, Any]):
+        """Initialize the bot with configuration parameters."""
+        self.config = config
+        self.client = Client(config["api_key"], config["api_secret"])
+        self.base_currency = config["base_currency"]
+        self.alt_currency = config["alt_currency"]
+        self.min_profit_percent = config["min_profit_percent"]
+        self.trade_amount = config["trade_amount"]
+        self.max_trade_count = config["max_trade_count"]
+        self.test_mode = config["test_mode"]
+        self.update_interval = config["update_interval"]
+        self.fee_rate = config["fee_rate"]
+        self.max_retries = config["max_retries"]
+        self.enable_rollback = config["enable_rollback"]
+        self.backoff_factor = config["backoff_factor"]
+        self.jitter = config["jitter"]
+
+        self.trade_count = 0
+        self.exchange_info = None
+        self.ticker_prices = {}
+        self.symbols_info = {}
+        self.potential_triangles = []
+
+        # Track successful trades
+        self.successful_trades = []
+
+        # Track active trades for rollback
+        self.active_trade = None
+
+        logger.info(f"Initializing Triangular Arbitrage Bot")
+        logger.info(f"Base Currency: {self.base_currency}")
+        logger.info(f"Alternative Currency: {self.alt_currency}")
+        logger.info(
+            f"Test Mode: {'Enabled' if self.test_mode else 'Disabled'}")
+        logger.info(f"Update Interval: {self.update_interval} seconds")
+        logger.info(
+            f"Rollback: {'Enabled' if self.enable_rollback else 'Disabled'}")
+
+    def initialize(self):
+        """Initialize exchange information and market data."""
+        logger.info("Fetching exchange information...")
+
+        try:
+            self.exchange_info = self.api_call_with_retry(
+                self.client.get_exchange_info
+            )
+
+            # Get trading rules for all symbols
+            for symbol_info in self.exchange_info['symbols']:
+                if symbol_info['status'] == 'TRADING':
+                    self.symbols_info[symbol_info['symbol']] = {
+                        'baseAsset': symbol_info['baseAsset'],
+                        'quoteAsset': symbol_info['quoteAsset'],
+                        'filters': symbol_info['filters']
+                    }
+
+            logger.info(
+                f"Loaded information for {len(self.symbols_info)} trading pairs")
+
+            # Find potential triangular paths
+            self.find_potential_triangles()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to initialize exchange information: {e}")
+            return False
+
+    def find_potential_triangles(self):
+        """Identify potential triangular arbitrage paths."""
+        logger.info("Finding potential triangular paths...")
+
+        # Find all trading pairs with base_currency
+        base_pairs = []
+        alt_pairs = []
+
+        for symbol, info in self.symbols_info.items():
+            if info['quoteAsset'] == self.base_currency:
+                base_pairs.append({
+                    'symbol': symbol,
+                    'baseAsset': info['baseAsset']
+                })
+            elif info['quoteAsset'] == self.alt_currency:
+                alt_pairs.append({
+                    'symbol': symbol,
+                    'baseAsset': info['baseAsset']
+                })
+
+        # Find triangular paths
+        for base_pair in base_pairs:
+            for alt_pair in alt_pairs:
+                if base_pair['baseAsset'] == alt_pair['baseAsset']:
+                    # Check if alt_currency to base_currency pair exists
+                    alt_to_base = f"{self.alt_currency}{self.base_currency}"
+                    if alt_to_base in self.symbols_info:
+                        triangle = {
+                            'step1': {
+                                'symbol': base_pair['symbol'],
+                                'operation': 'BUY',
+                                'from': self.base_currency,
+                                'to': base_pair['baseAsset']
+                            },
+                            'step2': {
+                                'symbol': alt_pair['symbol'],
+                                'operation': 'SELL',
+                                'from': alt_pair['baseAsset'],
+                                'to': self.alt_currency
+                            },
+                            'step3': {
+                                'symbol': alt_to_base,
+                                'operation': 'SELL',
+                                'from': self.alt_currency,
+                                'to': self.base_currency
+                            }
+                        }
+                        self.potential_triangles.append(triangle)
+
+        logger.info(
+            f"Found {len(self.potential_triangles)} potential triangular paths")
+
+    def api_call_with_retry(self, func, *args, **kwargs):
+        """Execute API call with exponential backoff retry logic."""
+        retries = 0
+        last_exception = None
+
+        while retries <= self.max_retries:
+            try:
+                return func(*args, **kwargs)
+            except BinanceAPIException as e:
+                last_exception = e
+
+                # Check if this is a rate limit error (code 429) or Cloudflare error (1013)
+                if e.code == 429 or e.code == 1013:
+                    wait_time = self.calculate_backoff_time(retries)
+                    logger.warning(
+                        f"Rate limit hit (code {e.code}). Retrying in {wait_time:.2f} seconds. Retry {retries+1}/{self.max_retries}")
+                    time.sleep(wait_time)
+                    retries += 1
+                else:
+                    # For other API errors, raise immediately
+                    raise
+            except Exception as e:
+                last_exception = e
+                wait_time = self.calculate_backoff_time(retries)
+                logger.warning(
+                    f"API error: {e}. Retrying in {wait_time:.2f} seconds. Retry {retries+1}/{self.max_retries}")
+                time.sleep(wait_time)
+                retries += 1
+
+        # If we've exhausted retries, raise the last exception
+        logger.error(f"API call failed after {self.max_retries} retries")
+        raise last_exception
+
+    def calculate_backoff_time(self, retry_count):
+        """Calculate backoff time with exponential growth and jitter."""
+        # Base backoff time: factor^retry_count
+        backoff = self.backoff_factor ** retry_count
+
+        # Add jitter: random value between 0 and jitter*backoff
+        max_jitter = backoff * self.jitter
+        jitter = random.uniform(0, max_jitter)
+
+        return backoff + jitter
+
+    def update_prices(self):
+        """Update current market prices."""
+        try:
+            prices = self.api_call_with_retry(self.client.get_all_tickers)
+            self.ticker_prices = {item['symbol']: float(
+                item['price']) for item in prices}
+            return True
+        except Exception as e:
+            logger.error(f"Error updating prices: {e}")
+            return False
+
+    def calculate_profit(self, triangle):
+        """Calculate potential profit for a triangular path."""
+        try:
+            # Get current prices
+            price1 = self.ticker_prices.get(triangle['step1']['symbol'])
+            price2 = self.ticker_prices.get(triangle['step2']['symbol'])
+            price3 = self.ticker_prices.get(triangle['step3']['symbol'])
+
+            if not all([price1, price2, price3]):
+                return None
+
+            # Calculate trade amounts with fees
+            fee_multiplier = 1 - (self.fee_rate / 100)
+
+            # Step 1: Convert base_currency to token
+            step1_amount = (self.trade_amount / price1) * fee_multiplier
+
+            # Step 2: Convert token to alt_currency
+            step2_amount = (step1_amount * price2) * fee_multiplier
+
+            # Step 3: Convert alt_currency back to base_currency
+            step3_amount = (step2_amount * price3) * fee_multiplier
+
+            # Calculate profit percentage
+            profit_percent = (
+                (step3_amount - self.trade_amount) / self.trade_amount) * 100
+
+            return {
+                'triangle': triangle,
+                'prices': {
+                    'price1': price1,
+                    'price2': price2,
+                    'price3': price3
+                },
+                'amounts': {
+                    'start': self.trade_amount,
+                    'step1': step1_amount,
+                    'step2': step2_amount,
+                    'step3': step3_amount
+                },
+                'profit_percent': profit_percent,
+                'profit_amount': step3_amount - self.trade_amount
+            }
+        except Exception as e:
+            logger.error(f"Error calculating profit: {e}")
+            return None
+
+    def find_arbitrage_opportunities(self):
+        """Find all current arbitrage opportunities."""
+        if not self.update_prices():
+            logger.warning(
+                "Failed to update prices, skipping opportunity check")
+            return []
+
+        opportunities = []
+
+        for triangle in self.potential_triangles:
+            result = self.calculate_profit(triangle)
+            if result and result['profit_percent'] > self.min_profit_percent:
+                opportunities.append(result)
+
+        # Sort by profit percentage (descending)
+        opportunities.sort(key=lambda x: x['profit_percent'], reverse=True)
+        return opportunities
+
+    def execute_arbitrage(self, opportunity):
+        """Execute a triangular arbitrage trade."""
+        if self.test_mode:
+            logger.info(
+                f"TEST MODE: Would execute trade with {opportunity['profit_percent']:.2f}% profit")
+            logger.info(
+                f"Step 1: {opportunity['triangle']['step1']['operation']} {opportunity['triangle']['step1']['symbol']}")
+            logger.info(
+                f"Step 2: {opportunity['triangle']['step2']['operation']} {opportunity['triangle']['step2']['symbol']}")
+            logger.info(
+                f"Step 3: {opportunity['triangle']['step3']['operation']} {opportunity['triangle']['step3']['symbol']}")
+
+            # Simulate successful trade in test mode
+            self.trade_count += 1
+            self.successful_trades.append({
+                'timestamp': time.time(),
+                'profit_percent': opportunity['profit_percent'],
+                'profit_amount': opportunity['profit_amount'],
+                'path': [
+                    opportunity['triangle']['step1']['symbol'],
+                    opportunity['triangle']['step2']['symbol'],
+                    opportunity['triangle']['step3']['symbol']
+                ]
+            })
+            return True
+
+        # Reset active trade tracking
+        self.active_trade = {
+            'opportunity': opportunity,
+            'status': 'starting',
+            'orders': {},
+            'current_step': 0,
+            'assets_held': {}
+        }
+
+        try:
+            # Step 1: Buy token with base_currency
+            step1 = opportunity['triangle']['step1']
+            self.active_trade['current_step'] = 1
+            self.active_trade['status'] = 'executing_step1'
+
+            quantity1 = self.calculate_quantity(
+                step1['symbol'],
+                opportunity['amounts']['start'] /
+                opportunity['prices']['price1']
+            )
+
+            order1 = self.api_call_with_retry(
+                self.client.create_order,
+                symbol=step1['symbol'],
+                side=step1['operation'],
+                type='MARKET',
+                quantity=quantity1
+            )
+
+            logger.info(
+                f"Step 1 complete: {step1['operation']} {quantity1} {step1['symbol']}")
+
+            # Update active trade status
+            self.active_trade['orders']['step1'] = order1
+            self.active_trade['status'] = 'completed_step1'
+            self.active_trade['assets_held'][step1['to']
+                                             ] = float(order1['executedQty'])
+
+            # Step 2: Sell token for alt_currency
+            step2 = opportunity['triangle']['step2']
+            self.active_trade['current_step'] = 2
+            self.active_trade['status'] = 'executing_step2'
+
+            quantity2 = self.calculate_quantity(
+                step2['symbol'],
+                float(order1['executedQty'])
+            )
+
+            order2 = self.api_call_with_retry(
+                self.client.create_order,
+                symbol=step2['symbol'],
+                side=step2['operation'],
+                type='MARKET',
+                quantity=quantity2
+            )
+
+            logger.info(
+                f"Step 2 complete: {step2['operation']} {quantity2} {step2['symbol']}")
+
+            # Update active trade status
+            self.active_trade['orders']['step2'] = order2
+            self.active_trade['status'] = 'completed_step2'
+            self.active_trade['assets_held'][step2['to']
+                                             ] = float(order2['cummulativeQuoteQty'])
+
+            # Step 3: Sell alt_currency for base_currency
+            step3 = opportunity['triangle']['step3']
+            self.active_trade['current_step'] = 3
+            self.active_trade['status'] = 'executing_step3'
+
+            quantity3 = self.calculate_quantity(
+                step3['symbol'],
+                float(order2['cummulativeQuoteQty'])
+            )
+
+            order3 = self.api_call_with_retry(
+                self.client.create_order,
+                symbol=step3['symbol'],
+                side=step3['operation'],
+                type='MARKET',
+                quantity=quantity3
+            )
+
+            logger.info(
+                f"Step 3 complete: {step3['operation']} {quantity3} {step3['symbol']}")
+
+            # Update active trade status
+            self.active_trade['orders']['step3'] = order3
+            self.active_trade['status'] = 'completed_step3'
+            self.active_trade['assets_held'][step3['to']
+                                             ] = float(order3['cummulativeQuoteQty'])
+
+            # Record successful trade
+            self.trade_count += 1
+            final_amount = float(order3['cummulativeQuoteQty'])
+            actual_profit = final_amount - opportunity['amounts']['start']
+            actual_profit_percent = (
+                actual_profit / opportunity['amounts']['start']) * 100
+
+            self.successful_trades.append({
+                'timestamp': time.time(),
+                'profit_percent': actual_profit_percent,
+                'profit_amount': actual_profit,
+                'path': [
+                    opportunity['triangle']['step1']['symbol'],
+                    opportunity['triangle']['step2']['symbol'],
+                    opportunity['triangle']['step3']['symbol']
+                ],
+                'orders': {
+                    'order1': order1['orderId'],
+                    'order2': order2['orderId'],
+                    'order3': order3['orderId']
+                }
+            })
+
+            logger.info(
+                f"Arbitrage complete! Profit: {actual_profit:.2f} {self.base_currency} ({actual_profit_percent:.2f}%)")
+
+            # Clear active trade
+            self.active_trade = None
+            return True
+
+        except (BinanceAPIException, BinanceOrderException) as e:
+            logger.error(f"Error executing arbitrage: {e}")
+
+            # Attempt rollback if enabled
+            if self.enable_rollback and self.active_trade:
+                logger.info(
+                    f"Attempting to rollback incomplete trade at step {self.active_trade['current_step']}")
+                self.rollback_incomplete_trade()
+
+            return False
+
+    def rollback_incomplete_trade(self):
+        """Rollback an incomplete trade by selling any assets back to base currency."""
+        if not self.active_trade:
+            logger.warning("No active trade to rollback")
+            return
+
+        try:
+            # Check which step failed and what assets we're holding
+            current_step = self.active_trade['current_step']
+            assets_held = self.active_trade['assets_held']
+            opportunity = self.active_trade['opportunity']
+
+            logger.info(
+                f"Rolling back from step {current_step} with assets: {assets_held}")
+
+            # If we failed after step 1 (holding the token)
+            if current_step == 1 and opportunity['triangle']['step1']['to'] in assets_held:
+                token = opportunity['triangle']['step1']['to']
+                token_amount = assets_held[token]
+                symbol = f"{token}{self.base_currency}"
+
+                # Check if this trading pair exists
+                if symbol in self.symbols_info:
+                    logger.info(
+                        f"Rolling back: Selling {token_amount} {token} for {self.base_currency}")
+
+                    quantity = self.calculate_quantity(symbol, token_amount)
+
+                    order = self.api_call_with_retry(
+                        self.client.create_order,
+                        symbol=symbol,
+                        side='SELL',
+                        type='MARKET',
+                        quantity=quantity
+                    )
+
+                    logger.info(
+                        f"Rollback complete: Sold {token} back to {self.base_currency}")
+                    return True
+                else:
+                    logger.warning(
+                        f"Cannot rollback: No direct pair {symbol} exists")
+
+            # If we failed after step 2 (holding alt_currency)
+            elif current_step == 2 and opportunity['triangle']['step2']['to'] in assets_held:
+                alt_amount = assets_held[opportunity['triangle']
+                                         ['step2']['to']]
+                symbol = opportunity['triangle']['step3']['symbol']
+
+                logger.info(
+                    f"Rolling back: Selling {alt_amount} {self.alt_currency} for {self.base_currency}")
+
+                quantity = self.calculate_quantity(symbol, alt_amount)
+
+                order = self.api_call_with_retry(
+                    self.client.create_order,
+                    symbol=symbol,
+                    side='SELL',
+                    type='MARKET',
+                    quantity=quantity
+                )
+
+                logger.info(
+                    f"Rollback complete: Sold {self.alt_currency} back to {self.base_currency}")
+                return True
+
+            logger.warning("No applicable assets found for rollback")
+            return False
+
+        except Exception as e:
+            logger.error(f"Error during rollback: {e}")
+            return False
+        finally:
+            # Clear active trade after rollback attempt
+            self.active_trade = None
+
+    def check_for_stranded_assets(self):
+        """Check for any stranded assets from previous failed trades and attempt to sell them."""
+        if self.test_mode:
+            return
+
+        try:
+            logger.info("Checking for stranded assets from previous trades...")
+
+            # Get account balances
+            account = self.api_call_with_retry(self.client.get_account)
+
+            for balance in account['balances']:
+                asset = balance['asset']
+                free_amount = float(balance['free'])
+
+                # Skip base currency and very small amounts
+                if asset == self.base_currency or free_amount < 0.00001:
+                    continue
+
+                # Check if we can sell this asset directly to base currency
+                symbol = f"{asset}{self.base_currency}"
+
+                if symbol in self.symbols_info and free_amount > 0:
+                    logger.info(f"Found stranded asset: {free_amount} {asset}")
+
+                    # Try to sell it back to base currency
+                    try:
+                        quantity = self.calculate_quantity(symbol, free_amount)
+
+                        # Only proceed if quantity is valid
+                        if float(quantity) > 0:
+                            logger.info(
+                                f"Selling stranded asset: {quantity} {asset}")
+
+                            order = self.api_call_with_retry(
+                                self.client.create_order,
+                                symbol=symbol,
+                                side='SELL',
+                                type='MARKET',
+                                quantity=quantity
+                            )
+
+                            logger.info(
+                                f"Successfully sold stranded {asset}: {order['executedQty']} for {order['cummulativeQuoteQty']} {self.base_currency}")
+                    except Exception as e:
+                        logger.error(f"Failed to sell stranded {asset}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error checking for stranded assets: {e}")
+
+    def calculate_quantity(self, symbol, quantity):
+        """Calculate and format the correct quantity based on exchange rules."""
+        symbol_info = self.symbols_info.get(symbol, {})
+
+        # Find the LOT_SIZE filter
+        lot_size_filter = next((f for f in symbol_info.get('filters', [])
+                               if f['filterType'] == 'LOT_SIZE'), None)
+
+        if lot_size_filter:
+            min_qty = float(lot_size_filter['minQty'])
+            max_qty = float(lot_size_filter['maxQty'])
+            step_size = float(lot_size_filter['stepSize'])
+
+            # Adjust quantity to step size
+            quantity = math.floor(quantity / step_size) * step_size
+
+            # Ensure quantity is within limits
+            quantity = max(min_qty, min(max_qty, quantity))
+
+            # Format to correct decimal places
+            decimal_places = len(str(step_size).split('.')[-1].rstrip('0'))
+            quantity = f"{quantity:.{decimal_places}f}"
+
+        return quantity
+
+    def save_results(self):
+        """Save trading results to a file."""
+        results = {
+            'config': {k: v for k, v in self.config.items() if k != 'api_secret'},
+            'trade_count': self.trade_count,
+            'successful_trades': self.successful_trades,
+            'timestamp': time.time()
+        }
+
+        with open('arbitrage_results.json', 'w') as f:
+            json.dump(results, f, indent=2)
+
+        logger.info(f"Results saved to arbitrage_results.json")
+
+    def run(self):
+        """Main bot execution loop."""
+        logger.info("Starting triangular arbitrage bot...")
+
+        try:
+            # Initialize exchange data
+            if not self.initialize():
+                logger.error("Failed to initialize. Exiting.")
+                return
+
+            # Check for stranded assets from previous runs
+            if self.enable_rollback:
+                self.check_for_stranded_assets()
+
+            # Main loop
+            while self.trade_count < self.max_trade_count:
+                logger.info(
+                    f"Looking for arbitrage opportunities... ({self.trade_count}/{self.max_trade_count})")
+
+                # Find opportunities
+                opportunities = self.find_arbitrage_opportunities()
+
+                if opportunities:
+                    best_opportunity = opportunities[0]
+                    logger.info(
+                        f"Found opportunity with {best_opportunity['profit_percent']:.2f}% profit")
+
+                    # Execute the trade
+                    success = self.execute_arbitrage(best_opportunity)
+
+                    if success:
+                        logger.info(
+                            f"Successfully executed trade {self.trade_count}/{self.max_trade_count}")
+                    else:
+                        logger.warning(
+                            "Failed to execute trade, will try again")
+
+                        # Add extra delay after failure
+                        time.sleep(self.calculate_backoff_time(1))
+                else:
+                    logger.info("No profitable opportunities found")
+
+                # Wait before next check
+                time.sleep(self.update_interval)
+
+            logger.info(
+                f"Completed {self.trade_count} trades. Shutting down...")
+            self.save_results()
+
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user")
+            self.save_results()
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            self.save_results()
+
+
+if _name_ == "_main_":
+    # Display warning and confirmation
+    print("\n" + "="*80)
+    print("WARNING: Cryptocurrency trading involves significant risk of loss.")
+    print("This script is for educational purposes only.")
+    print("The author is not responsible for any financial losses incurred.")
+    print("="*80 + "\n")
+
+    if CONFIG["test_mode"]:
+        print("Running in TEST MODE - no actual trades will be executed")
+    else:
+        confirm = input(
+            "You are about to run this bot in LIVE MODE. Are you sure? (yes/no): ")
+        if confirm.lower() != "yes":
+            print("Aborting...")
+            exit(0)
+
+    # Create and run the bot
+    bot = TriangularArbitrageBot(CONFIG)
+    bot.run()
